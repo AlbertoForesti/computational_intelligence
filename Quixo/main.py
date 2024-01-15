@@ -1,10 +1,8 @@
 import random
 from game import Game, Move, Player
-from typing import Tuple
+from typing import Any
 from collections import defaultdict
-from random import choice
 from tqdm import tqdm
-from copy import deepcopy
 from matplotlib import pyplot as plt
 import numpy as np
 import networkx as nx
@@ -31,21 +29,60 @@ class RandomPlayer(Player):
         move = random.choice([Move.TOP, Move.BOTTOM, Move.LEFT, Move.RIGHT])
         return from_pos, move
 
+class TransformDefaultDict(defaultdict):
+    def __init__(self, default_factory=None, key_transform=None, make_hash=None, *args, **kwargs):
+        self.key_transform = key_transform or (lambda x: x)
+        self.make_hash = make_hash or (lambda x: x)
+        self.transformed_keys = {}
+        super().__init__(default_factory, *args, **kwargs)
+    
+    def get_and_set_transformed_key(self, key):
+        hashable_key = self.make_hash(key)
+        if hashable_key in self.transformed_keys:
+            return self.transformed_keys[hashable_key]
+        else:
+            transformed_key = self.transformed_keys.get(hashable_key, self.key_transform(key))
+            self.transformed_keys[hashable_key] = transformed_key
+            return transformed_key
+
+    def __getitem__(self, key):
+        return super().__getitem__(self.get_and_set_transformed_key(key))
+
+    def __setitem__(self, key, value):
+        super().__setitem__(self.get_and_set_transformed_key(key), value)
+
+    def __delitem__(self, key):
+        super().__delitem__(self.get_and_set_transformed_key(key))
+    
+    def __call__(self, key) -> Any:
+        return self.get_and_set_transformed_key(key)
+
 class QLPlayer(Player):
-    def __init__(self, lr, df, epsilon, player_id) -> None:
+    def __init__(self, lr, df, epsilon, player_id, embedding = None) -> None:
         super().__init__()
         self._train = True
         self.lr = lr # Learning rate
         self.df = df # Discount factor
         self.player_id = player_id # Player id
-        self.policy = defaultdict(lambda: defaultdict(lambda: np.random.uniform(low=-1, high=1))) # Q(s,a) table
+        # self.policy = defaultdict(lambda: defaultdict(lambda: np.random.uniform(low=-1, high=1))) # Q(s,a) table
         self.previous_board = None # Stores the previous board state
         self.previous_move = None # Stores the previous move
         self.epsilon = epsilon
         self.verbose = False
         self.p = 1
+
+        if embedding is None:
+            self.policy = TransformDefaultDict(lambda: defaultdict(lambda: np.random.uniform(low=-1, high=1)), lambda x: self.get_identity_embedding(x), lambda x: self.get_identity_embedding(x))
+        elif embedding == 'graph':
+            self.policy = TransformDefaultDict(lambda: defaultdict(lambda: np.random.uniform(low=-1, high=1)), lambda x: self.get_graph_embedding(x), make_hash=lambda x: self.get_identity_embedding(x))
+        else:
+            raise NotImplementedError(f'Embedding {embedding} not implemented')
+
     
-    def create_graph_embedding(board):
+    def get_identity_embedding(self, board):
+        return tuple(np.array(board).flatten())
+
+    def get_graph_embedding(self, board):
         # Initialize a new graph
         graph = nx.Graph()
 
@@ -95,7 +132,7 @@ class QLPlayer(Player):
         return from_pos, move
     
     def make_best_move(self, game: 'Game') -> tuple[tuple[int, int], Move]:
-        current_board = tuple(game.get_board().flatten())
+        current_board = game.get_board()
         action_dict = self.policy[current_board]
         try:
             return max(action_dict.items(), key=lambda x: x[1])[0]
@@ -110,28 +147,32 @@ class QLPlayer(Player):
             if np.random.uniform(low=0, high=1) < self.p:
                 move = self.make_random_move(game)
             else:
-                if self.previous_board == tuple(game.get_board().flatten()):
+                if self.previous_board == self.policy(game.get_board()):
                     # Means that player did an illegal move
                     move = self.make_random_move(game)
                 else:
                     move = self.make_best_move(game)
             self.p *= self.epsilon
-            self.previous_board = tuple(game.get_board().flatten())
+            self.previous_board = self.policy(game.get_board())
             self.previous_move = move
             return move
         else:
-            if self.previous_board == tuple(game.get_board().flatten()):
+            if self.previous_board == self.policy(game.get_board()):
                 # Means that player did an illegal move
                 move = self.make_random_move(game)
             else:
                 move = self.make_best_move(game)
-            self.previous_board = tuple(game.get_board().flatten())
+            self.previous_board = self.policy(game.get_board())
             self.previous_move = move
             return move
 
     def update_policy(self, game: Game) -> None:
-        if self.previous_board is not None:    
-            optimal_estimate = 0 if len(self.policy[self.previous_move].values())==0 else max(self.policy[self.previous_move].values())
+        if self.previous_board is not None:
+            q_values = self.policy[self.previous_board].values()
+            if len(q_values) > 0:
+                optimal_estimate = max(q_values)
+            else:
+                optimal_estimate = 0
             self.policy[self.previous_board][self.previous_move] = (1-self.lr)*self.policy[self.previous_board][self.previous_move]+\
                 self.lr*(self.compute_reward(game)+self.df*optimal_estimate)
     
@@ -144,10 +185,10 @@ class QLPlayer(Player):
         if game.check_winner() == self.player_id:
             return 1
         elif game.check_winner() == -1:
-            if tuple(game.get_board().flatten()) == self.previous_board:
+            if self.policy(game.get_board()) == self.previous_board:
                 # Punish illegal move or cycle
                 return -1
-            return self.count_lines(game.get_board(), self.player_id)
+            return 0
         else:
             return -1
     
@@ -180,7 +221,7 @@ class QLPlayer(Player):
 
 class TrainTask:
 
-    def __init__(self, lr=0.1, df=0.9, epsilon=None, n_sim=1, num_matches=10000, test_freq=1000, test_matches=100, test_agent='random') -> None:
+    def __init__(self, lr=0.1, df=0.9, epsilon=None, n_sim=1, num_matches=10000, test_freq=1000, test_matches=100, test_agent='random', embedding=None) -> None:
         """
         Set parameters for the task
         """
@@ -193,6 +234,7 @@ class TrainTask:
         self.test_agent = test_agent
         self.n_sim = n_sim
         self.metrics = [[[],[]],[[],[]]] # Stores win and losses for trained agent startinng first or second 
+        self.embedding = embedding
 
         if epsilon is None:
             self.epsilon = 0.1**(1/num_matches)
@@ -245,7 +287,7 @@ class TrainTask:
         Execute training
         """
 
-        player1 = QLPlayer(self.lr, self.df, self.epsilon, 0)
+        player1 = QLPlayer(self.lr, self.df, self.epsilon, 0, embedding=self.embedding)
         player2 = RandomPlayer()
         player1.verbose = False
 
