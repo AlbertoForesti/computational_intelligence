@@ -98,8 +98,6 @@ class Game(object):
         num_iter = 0
         while winner < 0:
             num_iter += 1
-            if num_iter % 10000 == 0:
-                raise ValueError("Too many iterations")
             self.current_player_idx += 1
             self.current_player_idx %= len(players)
             ok = False
